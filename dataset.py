@@ -1,23 +1,75 @@
-import torch
-from pathlib import Path
-from pytorchvideo.data.video import VideoPathHandler
-from pytorchvideo.data.clip_sampling import make_clip_sampler, ClipSampler
-import os
-from pytorchvideo.data.labeled_video_dataset import labeled_video_dataset
-from pytorchvideo.data.utils import MultiProcessSampler
-from fractions import Fraction
-from torch.utils.data import IterableDataset
-from typing import Optional, Type, Callable, Any
+"""
+Dataset module for loading and pre-processing video data for classification tasks.
+"""
 import gc
-from pprint import pprint
+import logging
+import os
+from fractions import Fraction
+from math import ceil, floor
+from pathlib import Path
+from typing import Any, Callable, Optional, Type
+
+import av
 import numpy as np
+import torch
 import torch.nn.functional as F
+from pytorchvideo.data.clip_sampling import ClipSampler, make_clip_sampler
+from pytorchvideo.data.utils import MultiProcessSampler
+from pytorchvideo.data.video import VideoPathHandler
+from pytorchvideo.transforms import ApplyTransformToKey, ShortSideScale, UniformTemporalSubsample
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, IterableDataset, RandomSampler
+from torchvision.transforms import Compose, Lambda
+from torchvision.transforms._transforms_video import (
+    CenterCropVideo,
+    NormalizeVideo,
+)
 
 NUM_LABELS = 32
 
+logger = logging.getLogger(__name__)
+
+
+class SequentialRepeatedVideoSampler(torch.utils.data.Sampler):
+    """
+    Sequential-style sampler that repeats each video index consecutively.
+    For each video the number of repeats = ceil(video_duration / clip_duration).
+    Falls back to 1 repeat when duration cannot be determined.
+
+    Assumes labeled_videos is a list of tuples (video_path, info_dict) where info_dict contains 'duration' key.
+
+    Usage:
+        sampler = SequentialVideoSampler(labeled_video_paths, clip_duration)
+        val_dataset = VideoDataset(..., video_sampler=sampler, ...)
+    """
+    def __init__(self, labeled_videos: list[tuple[str, dict[str, Any]]], clip_duration: float = 2.0):
+        super().__init__()
+        self._labeled_videos = labeled_videos
+        self._clip_duration = float(clip_duration)
+        self._indices = self._build_index_list()
+
+    def _build_index_list(self):
+        indices = []
+        for idx, (_, info_dict) in enumerate(self._labeled_videos):
+            duration = info_dict.get("duration", 0.0) if isinstance(info_dict, dict) else 0.0
+            if duration <= 0 or self._clip_duration <= 0:
+                repeats = 1
+            else:
+                repeats = int(ceil(duration / self._clip_duration))
+                repeats = max(1, repeats)
+            indices.extend([idx] * repeats)
+        return indices
+
+    def __iter__(self):
+        # Return indices sequentially (no shuffling)
+        return iter(self._indices)
+
+    def __len__(self):
+        return len(self._indices)
+
 
 # Modified from https://github.com/facebookresearch/pytorchvideo/blob/main/pytorchvideo/data/labeled_video_dataset.py
-class VideoDataset(torch.utils.data.IterableDataset):
+class VideoDataset(IterableDataset):
     """
     LabeledVideoDataset handles the storage, loading, decoding and clip sampling for a
     video dataset. It assumes each video is stored as either an encoded video
@@ -32,7 +84,8 @@ class VideoDataset(torch.utils.data.IterableDataset):
         self,
         labeled_video_paths: list[tuple[str, Optional[dict]]],
         clip_sampler: ClipSampler,
-        labels_npz_path: Path | str,
+        fn2labels: dict,
+        split: str = "train",
         video_sampler: Type[torch.utils.data.Sampler] = torch.utils.data.RandomSampler,
         transform: Optional[Callable[[dict], Any]] = None,
         decode_audio: bool = True,
@@ -74,13 +127,14 @@ class VideoDataset(torch.utils.data.IterableDataset):
         # If a RandomSampler is used we need to pass in a custom random generator that
         # ensures all PyTorch multiprocess workers have the same random seed.
         self._video_random_generator = None
+        # if video_sampler == torch.utils.data.RandomSampler:
         if video_sampler == torch.utils.data.RandomSampler:
             self._video_random_generator = torch.Generator()
             self._video_sampler = video_sampler(
                 self._labeled_videos, generator=self._video_random_generator
             )
         else:
-            self._video_sampler = video_sampler(self._labeled_videos)
+            self._video_sampler = video_sampler(self._labeled_videos, clip_duration=self._clip_sampler._clip_duration)
 
         self._video_sampler_iter = None  # Initialized on first call to self.__next__()
 
@@ -93,7 +147,10 @@ class VideoDataset(torch.utils.data.IterableDataset):
         self.video_path_handler = VideoPathHandler()
 
         # the procedure to load labels is different to LabeledVideoDataset from pytorchvideo
-        self.labels_npz = np.load(labels_npz_path)
+        self.fn2labels = fn2labels
+
+        assert split in ["train", "val"], "split must be one of 'train', 'val'"
+        self._split = split
 
     @property
     def video_sampler(self):
@@ -111,10 +168,11 @@ class VideoDataset(torch.utils.data.IterableDataset):
             Number of videos in dataset.
         """
         return len(self.video_sampler)
-    
+
     def _get_labels(self, video_info: dict[str, Any]):
-        start, end, fps, name = video_info["clip_start"], video_info["clip_end"], video_info["fps"], video_info["video_name"]
-        frame_labels = torch.from_numpy(self.labels_npz[Path(name).stem][start * fps:end * fps])
+        start, end, rate, name = video_info["clip_start"], video_info["clip_end"], video_info["rate"], video_info["video_name"]
+        start_frame, end_frame = floor(start * rate), floor(end * rate)
+        frame_labels = torch.from_numpy(self.fn2labels[Path(name).stem][start_frame:end_frame])
         label = F.one_hot(frame_labels, NUM_LABELS).sum(dim=0).argmax()
         return label
 
@@ -146,7 +204,16 @@ class VideoDataset(torch.utils.data.IterableDataset):
             if self._loaded_video_label:
                 video, info_dict, video_index = self._loaded_video_label
             else:
-                video_index = next(self._video_sampler_iter)
+                # NOTE: During training, StopIteration would never be raised with this dataset
+                # need to manually handle epoch end in training and testing loops.
+                if self._split == "val":
+                    video_index = next(self._video_sampler_iter)
+                else:
+                    try:
+                        video_index = next(self._video_sampler_iter)
+                    except StopIteration:
+                        self._video_sampler_iter = iter(MultiProcessSampler(self._video_sampler))
+                        video_index = next(self._video_sampler_iter)
                 try:
                     video_path, info_dict = self._labeled_videos[video_index]
                     video = self.video_path_handler.video_from_path(
@@ -155,13 +222,13 @@ class VideoDataset(torch.utils.data.IterableDataset):
                     )
                     self._loaded_video_label = (video, info_dict, video_index)
                 except Exception as e:
-                    print(
+                    logger.warning(
                         "Failed to load video with error: {}; trial {}".format(
                             e,
                             i_try,
                         )
                     )
-                    print("Video load exception")
+                    logger.error("Video load exception")
                     continue
 
             (
@@ -215,16 +282,17 @@ class VideoDataset(torch.utils.data.IterableDataset):
                 gc.collect()
 
                 if video_is_null:
-                    print(
+                    logger.error(
                         "Failed to load clip {}; trial {}".format(video.name, i_try)
                     )
                     continue
-            
+
             info_dict["label"] = self._get_labels({
                 "clip_start": clip_start.numerator,
                 "clip_end": clip_end.numerator,
                 "video_name": video.name,
-                "fps": video._container.streams.video[0].base_rate.numerator,
+                # We assume info_dict contains 'rate' as Fraction
+                **info_dict
             })
 
             frames = self._loaded_clip["video"]
@@ -235,7 +303,7 @@ class VideoDataset(torch.utils.data.IterableDataset):
                 "video_index": video_index,
                 "clip_index": clip_index,
                 "aug_index": aug_index,
-                **info_dict,
+                **{k: float(v) if isinstance(v, Fraction) else v for k, v in info_dict.items()},
                 **({"audio": audio_samples} if audio_samples is not None else {}),
             }
             if self._transform is not None:
@@ -264,3 +332,106 @@ class VideoDataset(torch.utils.data.IterableDataset):
             self._video_random_generator.manual_seed(base_seed)
 
         return self
+
+
+class PackPathway(torch.nn.Module):
+    """
+    Transform for converting video frames as a list of tensors.
+    """
+
+    ALPHA = 4
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, frames: torch.Tensor):
+        fast_pathway = frames
+        # Perform temporal sampling from the fast pathway.
+        slow_pathway = torch.index_select(
+            frames,
+            1,
+            torch.linspace(
+                0, frames.shape[1] - 1, frames.shape[1] // self.ALPHA
+            ).long(),
+        )
+        frame_list = [slow_pathway, fast_pathway]
+        return frame_list
+
+
+def create_dataset(batch_size: int = 4, seed: int = 42, val_size: float = 0.2):
+    # Pre-defined parameters
+    side_size = 256
+    mean = [0.45, 0.45, 0.45]
+    std = [0.225, 0.225, 0.225]
+    crop_size = 256
+    num_frames = 32
+    sampling_rate = 2
+    frames_per_second = 30
+
+    # This is in seconds
+    clip_duration = (num_frames * sampling_rate) / frames_per_second
+
+    transform = ApplyTransformToKey(
+        key="video",
+        transform=Compose(
+            [
+                UniformTemporalSubsample(num_frames),
+                Lambda(lambda x: x / 255.0),
+                NormalizeVideo(mean, std),
+                ShortSideScale(
+                    size=side_size
+                ),
+                CenterCropVideo(crop_size),
+                PackPathway()
+            ]
+        ),
+    )
+
+    # Iterate through all videos and collect info dicts
+    video_dir = Path("dataset") / "videos" / "mp4"
+    labeled_video_paths = []
+    for video_fn in os.listdir(video_dir):
+        container = av.open(video_dir / video_fn)
+        video_stream = container.streams.video[0]
+
+        # Duration is in time_base units, convert to seconds
+        video_duration_seconds = float(video_stream.duration * video_stream.time_base)
+
+        # Labels to be assigned on the fly during dataset loading
+        labeled_video_paths.append((str(video_dir / video_fn), {'label': None, 'duration': video_duration_seconds, "rate": video_stream.base_rate}))
+        container.close()
+
+        logger.info(f"Read video {video_fn}, duration: {video_duration_seconds} seconds, rate: {video_stream.base_rate}")
+
+    train_video_paths, val_video_paths = train_test_split(labeled_video_paths, test_size=val_size, random_state=seed)
+
+    # Load pre-processed labels
+    filename_to_labels = dict()
+    with np.load(Path("dataset") / "annotations_processed.npz") as npz_file:
+        for key in npz_file.files:
+            filename_to_labels[key] = npz_file[key]
+
+    # Create datasets and dataloaders
+    train_dataset = VideoDataset(
+        labeled_video_paths=train_video_paths,
+        clip_sampler=make_clip_sampler("random", clip_duration),
+        fn2labels=filename_to_labels,
+        video_sampler=RandomSampler,
+        # video_sampler=partial(RandomSampler, replacement=True),
+        transform=transform
+    )
+
+    val_dataset = VideoDataset(
+        labeled_video_paths=val_video_paths,
+        clip_sampler=make_clip_sampler("uniform", clip_duration),
+        fn2labels=filename_to_labels,
+        video_sampler=SequentialRepeatedVideoSampler,
+        transform=transform
+    )
+
+    # train_dataloader = DataLoader(train_dataset, batch_size=4, num_workers=8)
+    # val_dataloader = DataLoader(val_dataset, batch_size=4, num_workers=8)
+    train_dataloader = DataLoader(train_dataset, batch_size=2)
+    val_dataloader = DataLoader(val_dataset, batch_size=2)
+
+    return train_dataloader, val_dataloader

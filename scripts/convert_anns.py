@@ -1,10 +1,16 @@
-from pathlib import Path
-import datetime
-import re
+#!/usr/bin/env python3
+"""
+Reads .txt labels extracted with `scripts/extract_anns_from_xlsx.py`
+and create an `.npz` file with frame label vectors and video filenames as keys.
+"""
+
 import os
+import re
+from pathlib import Path
+
 import cv2
 import numpy as np
-import json
+
 
 def time_str_to_seconds(time_str: str):
     hours, minutes, seconds, milliseconds = [
@@ -32,7 +38,6 @@ if __name__ == "__main__":
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         print(f"Processing {fn}, fps {fps}, total frames: {total_frames}")
 
-
         with open(annotation_dir / f"{fn}.txt", "r") as fp:
             lines = fp.read().splitlines()
 
@@ -46,7 +51,7 @@ if __name__ == "__main__":
             frame_labels[start_frame_idx:end_frame_idx] = idx + 1
 
             print(f"Processed line {idx}, start: {start}, end: {end}, start frame: {start_frame_idx}, end frame: {end_frame_idx}")
-        
+
         filename2labels[fn] = frame_labels
-    
+
     np.savez(output_dir, **filename2labels)
