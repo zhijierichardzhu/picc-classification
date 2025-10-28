@@ -288,8 +288,8 @@ class VideoDataset(IterableDataset):
                     continue
 
             info_dict["label"] = self._get_labels({
-                "clip_start": clip_start.numerator,
-                "clip_end": clip_end.numerator,
+                "clip_start": clip_start,
+                "clip_end": clip_end,
                 "video_name": video.name,
                 # We assume info_dict contains 'rate' as Fraction
                 **info_dict
@@ -417,7 +417,6 @@ def create_dataset(batch_size: int = 4, seed: int = 42, val_size: float = 0.2):
         clip_sampler=make_clip_sampler("random", clip_duration),
         fn2labels=filename_to_labels,
         video_sampler=RandomSampler,
-        # video_sampler=partial(RandomSampler, replacement=True),
         transform=transform
     )
 
@@ -429,9 +428,9 @@ def create_dataset(batch_size: int = 4, seed: int = 42, val_size: float = 0.2):
         transform=transform
     )
 
-    # train_dataloader = DataLoader(train_dataset, batch_size=4, num_workers=8)
-    # val_dataloader = DataLoader(val_dataset, batch_size=4, num_workers=8)
-    train_dataloader = DataLoader(train_dataset, batch_size=2)
-    val_dataloader = DataLoader(val_dataset, batch_size=2)
+    train_dataloader = DataLoader(train_dataset, batch_size=8, num_workers=8)
+    val_dataloader = DataLoader(val_dataset, batch_size=8, num_workers=8)
+
+    logger.info("Created train and val datasets")
 
     return train_dataloader, val_dataloader
