@@ -1,2 +1,6 @@
 dataset/
 logs/
+checkpoints/
+__pycache__/
+.vscode/
+*.pyc

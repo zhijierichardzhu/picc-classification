@@ -1,5 +1,6 @@
 """
 Dataset module for loading and pre-processing video data for classification tasks.
+Model transform parameters are from: https://pytorch.org/hub/facebookresearch_pytorchvideo_x3d/
 """
 import gc
 import logging
@@ -25,7 +26,7 @@ from torchvision.transforms._transforms_video import (
     NormalizeVideo,
 )
 
-NUM_LABELS = 32
+NUM_LABELS = 33
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +76,9 @@ class VideoDataset(IterableDataset):
     video dataset. It assumes each video is stored as either an encoded video
     (e.g. mp4, avi) or a frame video (e.g. a folder of jpg, or png)
 
-    Note that the label is assigned aftet the clip is sampled
+    NOTE: the label is assigned after the clip is sampled,
+    if split is 'train', random clip sampling is used and sampling will be repeated indefinitely,
+    if split is 'val', uniform clip sampling is used.
     """
 
     _MAX_CONSECUTIVE_FAILURES = 10
@@ -134,7 +137,8 @@ class VideoDataset(IterableDataset):
                 self._labeled_videos, generator=self._video_random_generator
             )
         else:
-            self._video_sampler = video_sampler(self._labeled_videos, clip_duration=self._clip_sampler._clip_duration)
+            # NOTE: this should be used with uniform clip sampler for validation
+            self._video_sampler = range(len(self._labeled_videos))
 
         self._video_sampler_iter = None  # Initialized on first call to self.__next__()
 
@@ -151,6 +155,10 @@ class VideoDataset(IterableDataset):
 
         assert split in ["train", "val"], "split must be one of 'train', 'val'"
         self._split = split
+
+    def __len__(self):
+        clip_duration = self._clip_sampler._clip_duration
+        return sum(floor(info["duration"] / clip_duration) for _, info in self._labeled_videos) if isinstance(self._video_sampler, range) else None
 
     @property
     def video_sampler(self):
@@ -358,14 +366,14 @@ class PackPathway(torch.nn.Module):
         return frame_list
 
 
-def create_dataset(batch_size: int = 4, seed: int = 42, val_size: float = 0.2):
+def create_dataset(train_batch_size: int = 16, seed: int = 42, val_size: float = 0.2, sample_pathways = False):
     # Pre-defined parameters
     side_size = 256
     mean = [0.45, 0.45, 0.45]
     std = [0.225, 0.225, 0.225]
     crop_size = 256
-    num_frames = 32
-    sampling_rate = 2
+    num_frames = 16
+    sampling_rate = 5
     frames_per_second = 30
 
     # This is in seconds
@@ -382,8 +390,7 @@ def create_dataset(batch_size: int = 4, seed: int = 42, val_size: float = 0.2):
                     size=side_size
                 ),
                 CenterCropVideo(crop_size),
-                PackPathway()
-            ]
+            ] + ([PackPathway()] if sample_pathways else []),
         ),
     )
 
@@ -397,13 +404,17 @@ def create_dataset(batch_size: int = 4, seed: int = 42, val_size: float = 0.2):
         # Duration is in time_base units, convert to seconds
         video_duration_seconds = float(video_stream.duration * video_stream.time_base)
 
-        # Labels to be assigned on the fly during dataset loading
+        # Clip labels to be assigned on the fly during dataset loading
         labeled_video_paths.append((str(video_dir / video_fn), {'label': None, 'duration': video_duration_seconds, "rate": video_stream.base_rate}))
+
         container.close()
 
-        logger.info(f"Read video {video_fn}, duration: {video_duration_seconds} seconds, rate: {video_stream.base_rate}")
-
     train_video_paths, val_video_paths = train_test_split(labeled_video_paths, test_size=val_size, random_state=seed)
+
+    for idx, (video_fn, info_dict) in enumerate(train_video_paths):
+        logger.info(f"Training video {idx} {Path(video_fn).stem}, duration: {info_dict['duration']} seconds, rate: {info_dict['rate']}")
+    for idx, (video_fn, info_dict) in enumerate(val_video_paths):
+        logger.info(f"Validation video {idx} {Path(video_fn).stem}, duration: {info_dict['duration']} seconds, rate: {info_dict['rate']}")
 
     # Load pre-processed labels
     filename_to_labels = dict()
@@ -417,7 +428,8 @@ def create_dataset(batch_size: int = 4, seed: int = 42, val_size: float = 0.2):
         clip_sampler=make_clip_sampler("random", clip_duration),
         fn2labels=filename_to_labels,
         video_sampler=RandomSampler,
-        transform=transform
+        transform=transform,
+        split="train"
     )
 
     val_dataset = VideoDataset(
@@ -425,11 +437,12 @@ def create_dataset(batch_size: int = 4, seed: int = 42, val_size: float = 0.2):
         clip_sampler=make_clip_sampler("uniform", clip_duration),
         fn2labels=filename_to_labels,
         video_sampler=SequentialRepeatedVideoSampler,
-        transform=transform
+        transform=transform,
+        split="val"
     )
 
-    train_dataloader = DataLoader(train_dataset, batch_size=8, num_workers=8)
-    val_dataloader = DataLoader(val_dataset, batch_size=8, num_workers=8)
+    train_dataloader = DataLoader(train_dataset, batch_size=train_batch_size, num_workers=4)
+    val_dataloader = DataLoader(val_dataset, batch_size=1)
 
     logger.info("Created train and val datasets")
 
