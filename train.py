@@ -12,7 +12,8 @@ from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 from torcheval.metrics import MulticlassAccuracy, MulticlassConfusionMatrix, Mean
 from tqdm import tqdm
-from torch.optim import SGD, Optimizer
+from torch.optim import SGD, Adam, AdamW, Optimizer
+from torch.optim.lr_scheduler import StepLR
 
 from dataset import NUM_LABELS, create_dataset
 
@@ -31,6 +32,15 @@ def create_network(name: str, num_classes: int=NUM_LABELS) -> nn.Module:
     return model
 
 
+def get_grad_norm(network: nn.Module):
+    grads = [
+        param.grad.detach().flatten()
+        for param in network.parameters()
+        if param.grad is not None
+    ]
+    return torch.cat(grads).norm().item()
+
+
 def create_optimizer(
         model: nn.Module,
         name: str,
@@ -40,9 +50,9 @@ def create_optimizer(
     if name == "sgd":
         optimizer = SGD(model.parameters(), lr=lr, momentum=momentum)
     elif name == "adam":
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        optimizer = Adam(model.parameters(), lr=lr)
     elif name == "adamw":
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+        optimizer = AdamW(model.parameters(), lr=lr)
     else:
         raise ValueError(f"Unsupported optimizer: {name}")
     return optimizer
@@ -56,7 +66,8 @@ def train_epoch(
         criterion: nn.Module | Callable,
         writer: SummaryWriter,
         device: str | torch.device = "cpu",
-        global_step=0
+        global_step=0,
+        clip_grad: bool = False
     ):
     model.train()
 
@@ -80,6 +91,11 @@ def train_epoch(
         preds = outputs.argmax(dim=1)
 
         loss.backward()
+
+        grad_norm = get_grad_norm(model)
+        if clip_grad:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+
         optimizer.step()
 
         mean_loss.update(torch.stack([loss] * labels.size(0)))
@@ -87,6 +103,7 @@ def train_epoch(
         confusion_matrix.update(preds, labels)
 
         # Log metrics to TensorBoard per step
+        writer.add_scalar("GradNorm/Train", grad_norm, global_step + step)
         writer.add_scalar("Loss/Train", loss.item(), global_step + step)
 
     return {
@@ -119,7 +136,6 @@ def val_epoch(
                 frames = batch["video"].to(device)  # shape: (B, C, T, H, W)
             labels = batch["label"].to(device)
 
-            print(frames.device, labels.device)
             outputs = model(frames)
             preds = outputs.argmax(dim=1)
 
@@ -156,11 +172,15 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="x3d_m", choices=feature_sizes.keys())
 
     # Optimizer
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--steps-per-epoch", type=int, default=500)
     parser.add_argument("--optimizer", type=str, default="sgd", choices=["sgd", "adam", "adamw"])
     parser.add_argument("--momentum", type=float, default=0.9, help="Only used for SGD optimizer")
+    parser.add_argument("--clip-grad", action="store_true", help="Whether to clip gradients")
+
+    parser.add_argument("--use-lr-scheduler", action="store_true", help="Whether to use a learning rate scheduler")
+    parser.add_argument("--lr-step-size", type=int, default=10, help="Step size for StepLR scheduler")
 
     args = parser.parse_args()
 
@@ -197,6 +217,7 @@ if __name__ == "__main__":
 
     # Create optimizer and scheduler
     optimizer = create_optimizer(model, args.optimizer, args.lr, args.momentum)
+    scheduler = StepLR(optimizer, step_size=args.lr_step_size, gamma=0.1) if args.use_lr_scheduler else None
 
     # Initialize TensorBoard SummaryWriter
     writer = SummaryWriter(log_dir=logdir.as_posix())
@@ -204,17 +225,37 @@ if __name__ == "__main__":
     best_val_acc = 0.0
     global_step = 0
     for epoch in range(1, args.epochs + 1):
-        metrics = train_epoch(model, args.steps_per_epoch, train_loader_iter, optimizer, criterion, writer, device, global_step)
+        metrics = train_epoch(
+            model=model,
+            steps_per_epoch=args.steps_per_epoch,
+            dataloader_iter=train_loader_iter,
+            optimizer=optimizer,
+            criterion=criterion,
+            writer=writer,
+            device=device,
+            global_step=global_step,
+            clip_grad=args.clip_grad
+        )
         global_step = metrics['steps']
         logger.info(f"Epoch {epoch}/{args.epochs} - train_loss: {metrics['loss']:.4f} train_acc: {metrics['accuracy']:.4f}")
 
-        val_metrics = val_epoch(model, val_loader, criterion, epoch, writer, device)
+        if scheduler:
+            scheduler.step()
+
+        val_metrics = val_epoch(
+            model=model,
+            dataloader=val_loader,
+            criterion=criterion,
+            epoch=epoch,
+            writer=writer,
+            device=device
+        )
         logger.info(f"Epoch {epoch}/{args.epochs} - val_loss: {val_metrics['loss']:.4f} val_acc: {val_metrics['accuracy']:.4f}")
 
         if val_metrics['accuracy'] > best_val_acc:
             best_val_acc = val_metrics['accuracy']
             checkpoint = {
-                'model': {k:v.detach().cpu() for k,v in model.state_dict().items()},
+                'model': {k: v.detach().cpu() for k,v in model.state_dict().items()},
                 'optimizer': optimizer.state_dict(),
                 'args': args,
                 'epoch': epoch,
@@ -224,7 +265,7 @@ if __name__ == "__main__":
                 'val_confusion_matrix': val_metrics['confusion_matrix']
             }
             torch.save(checkpoint, ckpt_dir / f"{args.name}.pth")
-            logger.info(f"Saved best model to {(ckpt_dir / f'{args.name}.pth').as_posix} (val_acc={best_val_acc:.4f})")
+            logger.info(f"Saved best model to {(ckpt_dir / f'{args.name}.pth').as_posix()} (val_acc={best_val_acc:.4f})")
 
     # Close the TensorBoard writer
     writer.close()
